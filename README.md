@@ -43,6 +43,73 @@ Run in elevated PowerShell:
   -RunOnce
 ```
 
+Scheduled task trigger is configured to repeat every `IntervalMinutes` with repetition duration `365` days.
+
+## Test before install (non-DC friendly)
+
+If you want to validate email/report flow before deploying on a Domain Controller:
+
+1. Create a temporary config JSON (example: `.\KerberosRc4Monitor.config.json`) with your SMTP settings.
+2. Create a test events JSON file (example below).
+3. Run monitor script in test-input mode.
+
+Example test input file `.\sample-test-events.json`:
+
+```json
+[
+  {
+    "TimeCreatedUtc": "2026-05-22 08:00:00",
+    "LogName": "Security",
+    "EventId": 4769,
+    "RecordId": 123456,
+    "EvidenceType": "Actual RC4 Kerberos ticket/session/pre-auth evidence",
+    "RC4Trigger": "TicketEncryptionType=0x17",
+    "TargetUserName": "testuser",
+    "ServiceName": "HTTP/rc4test.internal.local",
+    "ClientAddress": "10.10.10.25",
+    "TicketEncryptionType": "0x17",
+    "EventMessage": "Synthetic RC4 test event"
+  },
+  {
+    "TimeCreatedUtc": "2026-05-22 08:02:00",
+    "LogName": "System",
+    "EventId": 203,
+    "RecordId": 98765,
+    "EvidenceType": "RC4 dependency/hardening warning or enforcement event",
+    "TargetUserName": "svc_legacy",
+    "ServiceName": "MSSQLSvc/sql01.internal.local:1433",
+    "EventMessage": "Synthetic Kdcsvc hardening event"
+  }
+]
+```
+
+Run test mode:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\KerberosRc4Monitor.ps1 -ConfigPath .\KerberosRc4Monitor.config.json -TestInputJsonPath .\sample-test-events.json
+```
+
+In test-input mode:
+
+- no event logs are read
+- no state file updates are performed
+- report/email logic runs using JSON input records
+
+## Test email from installer
+
+You can test SMTP delivery directly from installer:
+
+```powershell
+.\Install-KerberosRc4MonitorTask.ps1 `
+  -SmtpServer "smtp-relay.internal.local" `
+  -SmtpPort 25 `
+  -From "kerberos-monitor@internal.local" `
+  -To "ad-team@internal.local" `
+  -EnvironmentName "TEST" `
+  -SubjectPrefix "[TEST] Kerberos RC4 Monitor" `
+  -TestEmail
+```
+
 ## Where to set mail server and sender/recipient addresses
 
 You can set them in either place:

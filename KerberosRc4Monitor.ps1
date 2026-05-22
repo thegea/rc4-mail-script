@@ -3,7 +3,10 @@
 param(
     [Parameter()]
     [ValidateNotNullOrEmpty()]
-    [string]$ConfigPath = 'C:\ProgramData\KerberosRc4Monitor\KerberosRc4Monitor.config.json'
+    [string]$ConfigPath = 'C:\ProgramData\KerberosRc4Monitor\KerberosRc4Monitor.config.json',
+
+    [Parameter()]
+    [string]$TestInputJsonPath
 )
 
 Set-StrictMode -Version 2.0
@@ -750,12 +753,143 @@ function Send-MonitorEmail {
     }
 }
 
+function Convert-TestInputRecord {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [psobject]$InputRecord,
+
+        [Parameter(Mandatory = $true)]
+        [ValidateRange(200, 100000)]
+        [int]$MaxMessageLength
+    )
+
+    $nowLocal = Get-Date
+    $nowUtc = $nowLocal.ToUniversalTime().ToString('yyyy-MM-dd HH:mm:ss')
+
+    $record = @{
+        TimeCreated                          = $nowLocal.ToString('yyyy-MM-dd HH:mm:ss')
+        TimeCreatedUtc                       = $nowUtc
+        DCName                               = $env:COMPUTERNAME
+        DomainName                           = $env:USERDNSDOMAIN
+        LogName                              = 'Security'
+        EventId                              = 4769
+        RecordId                             = 0
+        ProviderName                         = 'TestInput'
+        LevelDisplayName                     = 'Information'
+        MachineName                          = $env:COMPUTERNAME
+        EvidenceType                         = 'Actual RC4 Kerberos ticket/session/pre-auth evidence'
+        RC4Trigger                           = ''
+        TargetUserName                       = $null
+        TargetDomainName                     = $null
+        TargetSid                            = $null
+        AccountName                          = $null
+        AccountDomain                        = $null
+        ServiceName                          = $null
+        ServiceSid                           = $null
+        SPN                                  = $null
+        ClientAddress                        = $null
+        IpAddress                            = $null
+        IpPort                               = $null
+        WorkstationName                      = $null
+        TicketEncryptionType                 = $null
+        SessionKeyEncryptionType             = $null
+        PreAuthEncryptionType                = $null
+        ClientAdvertizedEncryptionTypes      = $null
+        ClientAdvertisedEncryptionTypes      = $null
+        AdvertizedEtypes                     = $null
+        AdvertisedEtypes                     = $null
+        AccountSupportedEncryptionTypes      = $null
+        AccountAvailableKeys                 = $null
+        ServiceSupportedEncryptionTypes      = $null
+        ServiceAvailableKeys                 = $null
+        DCSupportedEncryptionTypes           = $null
+        DCAvailableKeys                      = $null
+        'msDS-SupportedEncryptionTypes'      = $null
+        TicketOptions                        = $null
+        Status                               = $null
+        FailureCode                          = $null
+        ErrorCode                            = $null
+        PreAuthType                          = $null
+        TransmittedServices                  = $null
+        EventMessage                         = ''
+        RawEventDataJson                     = '{}'
+    }
+
+    foreach ($property in $InputRecord.PSObject.Properties) {
+        if ($record.ContainsKey($property.Name)) {
+            $record[$property.Name] = $property.Value
+        }
+    }
+
+    if ([string]::IsNullOrWhiteSpace([string]$record.EventMessage)) {
+        $record.EventMessage = ''
+    }
+    if ($record.EventMessage.Length -gt $MaxMessageLength) {
+        $record.EventMessage = $record.EventMessage.Substring(0, $MaxMessageLength) + '...[truncated]'
+    }
+
+    if ([string]::IsNullOrWhiteSpace([string]$record.RawEventDataJson)) {
+        $record.RawEventDataJson = ($InputRecord | ConvertTo-Json -Depth 8 -Compress)
+    }
+
+    if ([string]::IsNullOrWhiteSpace([string]$record.EvidenceType)) {
+        $eventIdInt = 0
+        try { $eventIdInt = [int]$record.EventId } catch { $eventIdInt = 0 }
+        if ($eventIdInt -in @(201, 202, 203, 204, 206, 207, 208, 209)) {
+            $record.EvidenceType = 'RC4 dependency/hardening warning or enforcement event'
+        }
+        else {
+            $record.EvidenceType = 'Actual RC4 Kerberos ticket/session/pre-auth evidence'
+        }
+    }
+
+    return [pscustomobject]$record
+}
+
+function Read-TestInputRecords {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
+        [string]$Path,
+
+        [Parameter(Mandatory = $true)]
+        [ValidateRange(200, 100000)]
+        [int]$MaxMessageLength
+    )
+
+    if (-not (Test-Path -LiteralPath $Path)) {
+        throw "Test input JSON file not found: $Path"
+    }
+
+    $raw = Get-Content -LiteralPath $Path -Encoding UTF8 -Raw
+    $parsed = $raw | ConvertFrom-Json
+    $items = @($parsed)
+    if ($items.Count -eq 0) {
+        throw "Test input JSON file is empty: $Path"
+    }
+
+    $records = New-Object System.Collections.Generic.List[object]
+    foreach ($item in $items) {
+        if ($null -eq $item) {
+            continue
+        }
+        [void]$records.Add((Convert-TestInputRecord -InputRecord $item -MaxMessageLength $MaxMessageLength))
+    }
+
+    return $records.ToArray()
+}
+
 function Invoke-KerberosRc4Monitor {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)]
         [ValidateNotNullOrEmpty()]
-        [string]$MonitorConfigPath
+        [string]$MonitorConfigPath,
+
+        [Parameter()]
+        [string]$TestInputPath
     )
 
     $config = Read-MonitorConfig -Path $MonitorConfigPath
@@ -768,70 +902,91 @@ function Invoke-KerberosRc4Monitor {
     $logFile = Join-Path -Path $config.LogPath -ChildPath ('KerberosRc4Monitor-{0}.log' -f (Get-Date -Format 'yyyyMMdd'))
     Invoke-LogRetention -LogDirectory $config.LogPath -RetentionDays ([int]$config.LogRetentionDays) -CurrentLogPath $logFile
 
-    $mutexName = 'Global\KerberosRc4MonitorMutex'
-    $mutex = Acquire-MonitorLock -LockName $mutexName
-    if (-not $mutex) {
-        Write-MonitorLog -Message 'Another monitor instance is active; exiting this run.' -Level 'WARN' -LogPath $logFile
-        return
+    $isTestInputMode = -not [string]::IsNullOrWhiteSpace($TestInputPath)
+    $mutex = $null
+    if (-not $isTestInputMode) {
+        $mutexName = 'Global\KerberosRc4MonitorMutex'
+        $mutex = Acquire-MonitorLock -LockName $mutexName
+        if (-not $mutex) {
+            Write-MonitorLog -Message 'Another monitor instance is active; exiting this run.' -Level 'WARN' -LogPath $logFile
+            return
+        }
     }
 
     try {
         $runStartUtc = (Get-Date).ToUniversalTime()
         Write-MonitorLog -Message ("Run started. ConfigPath={0}" -f $MonitorConfigPath) -Level 'INFO' -LogPath $logFile
 
-        $state = Read-MonitorState -StatePath $config.StatePath
-        $stateByLog = @{}
-        foreach ($entry in $state.Logs) {
-            $stateByLog[$entry.LogName] = $entry
-        }
+        $state = $null
+        $securityState = $null
+        $systemState = $null
+        $newSecurityRecordId = 0L
+        $newSystemRecordId = 0L
+        $recordsArray = @()
+        $matchingCount = 0
 
-        foreach ($logName in @('Security', 'System')) {
-            if (-not $stateByLog.ContainsKey($logName)) {
-                $newEntry = New-DefaultLogState -LogName $logName
-                $state.Logs += $newEntry
-                $stateByLog[$logName] = $newEntry
+        if ($isTestInputMode) {
+            Write-MonitorLog -Message ("Test input mode enabled. TestInputJsonPath={0}" -f $TestInputPath) -Level 'INFO' -LogPath $logFile
+            $recordsArray = Read-TestInputRecords -Path $TestInputPath -MaxMessageLength ([int]$config.MaxMessageLength
+            )
+            $matchingCount = @($recordsArray).Count
+            Write-MonitorLog -Message ("Loaded test records: {0}" -f $matchingCount) -Level 'INFO' -LogPath $logFile
+        }
+        else {
+            $state = Read-MonitorState -StatePath $config.StatePath
+            $stateByLog = @{}
+            foreach ($entry in $state.Logs) {
+                $stateByLog[$entry.LogName] = $entry
             }
-            $stateByLog[$logName].LastRunStartedUtc = $runStartUtc.ToString('o')
-        }
 
-        $securityIds = 4768, 4769, 4770
-        $kdcsvcIds = 201, 202, 203, 204, 206, 207, 208, 209
-
-        $securityState = $stateByLog['Security']
-        $systemState = $stateByLog['System']
-
-        $securityQuery = Get-NewEventsForLog -LogName 'Security' -EventIds $securityIds -LastRecordId ([long]$securityState.LastRecordId) -FirstRunLookbackMinutes ([int]$config.LookbackMinutesOnFirstRun) -SafeLookbackMinutesOnRollover ([int]$config.SafeLookbackMinutesOnRollover) -LogPath $logFile
-        $systemQuery = Get-NewEventsForLog -LogName 'System' -EventIds $kdcsvcIds -LastRecordId ([long]$systemState.LastRecordId) -FirstRunLookbackMinutes ([int]$config.LookbackMinutesOnFirstRun) -SafeLookbackMinutesOnRollover ([int]$config.SafeLookbackMinutesOnRollover) -LogPath $logFile
-
-        $securityEvents = @($securityQuery.Events)
-        $systemEvents = @($systemQuery.Events | Where-Object { $_.ProviderName -match '^Microsoft-Windows-Kerberos-Key-Distribution-Center$|^Kdcsvc$' })
-
-        Write-MonitorLog -Message ("Fetched candidate events: Security={0}, SystemKdcsvc={1}" -f $securityEvents.Count, $systemEvents.Count) -Level 'INFO' -LogPath $logFile
-
-        $records = New-Object System.Collections.Generic.List[object]
-        foreach ($event in $securityEvents) {
-            $map = Get-EventDataMap -EventRecord $event
-            $triggers = Get-Rc4Trigger -Map $map
-            if ($triggers.Count -gt 0) {
-                [void]$records.Add((Convert-EventToRc4Record -EventRecord $event -EvidenceType 'SecurityRc4Evidence' -Rc4Triggers $triggers -MaxMessageLength ([int]$config.MaxMessageLength)))
+            foreach ($logName in @('Security', 'System')) {
+                if (-not $stateByLog.ContainsKey($logName)) {
+                    $newEntry = New-DefaultLogState -LogName $logName
+                    $state.Logs += $newEntry
+                    $stateByLog[$logName] = $newEntry
+                }
+                $stateByLog[$logName].LastRunStartedUtc = $runStartUtc.ToString('o')
             }
-        }
 
-        foreach ($event in $systemEvents) {
-            [void]$records.Add((Convert-EventToRc4Record -EventRecord $event -EvidenceType 'KdcsvcDependencyOrHardening' -Rc4Triggers @() -MaxMessageLength ([int]$config.MaxMessageLength)))
-        }
+            $securityIds = 4768, 4769, 4770
+            $kdcsvcIds = 201, 202, 203, 204, 206, 207, 208, 209
 
-        $recordsArray = $records.ToArray()
-        $matchingCount = $recordsArray.Count
-        Write-MonitorLog -Message ("Matching events count: {0}" -f $matchingCount) -Level 'INFO' -LogPath $logFile
+            $securityState = $stateByLog['Security']
+            $systemState = $stateByLog['System']
 
-        $newSecurityRecordId = [long]$securityState.LastRecordId
-        $newSystemRecordId = [long]$systemState.LastRecordId
-        if ($securityEvents.Count -gt 0) {
-            $newSecurityRecordId = [long](($securityEvents | Select-Object -Last 1).RecordId)
-        }
-        if ($systemQuery.Events.Count -gt 0) {
-            $newSystemRecordId = [long](($systemQuery.Events | Select-Object -Last 1).RecordId)
+            $securityQuery = Get-NewEventsForLog -LogName 'Security' -EventIds $securityIds -LastRecordId ([long]$securityState.LastRecordId) -FirstRunLookbackMinutes ([int]$config.LookbackMinutesOnFirstRun) -SafeLookbackMinutesOnRollover ([int]$config.SafeLookbackMinutesOnRollover) -LogPath $logFile
+            $systemQuery = Get-NewEventsForLog -LogName 'System' -EventIds $kdcsvcIds -LastRecordId ([long]$systemState.LastRecordId) -FirstRunLookbackMinutes ([int]$config.LookbackMinutesOnFirstRun) -SafeLookbackMinutesOnRollover ([int]$config.SafeLookbackMinutesOnRollover) -LogPath $logFile
+
+            $securityEvents = @($securityQuery.Events)
+            $systemEvents = @($systemQuery.Events | Where-Object { $_.ProviderName -match '^Microsoft-Windows-Kerberos-Key-Distribution-Center$|^Kdcsvc$' })
+
+            Write-MonitorLog -Message ("Fetched candidate events: Security={0}, SystemKdcsvc={1}" -f $securityEvents.Count, $systemEvents.Count) -Level 'INFO' -LogPath $logFile
+
+            $records = New-Object System.Collections.Generic.List[object]
+            foreach ($event in $securityEvents) {
+                $map = Get-EventDataMap -EventRecord $event
+                $triggers = Get-Rc4Trigger -Map $map
+                if ($triggers.Count -gt 0) {
+                    [void]$records.Add((Convert-EventToRc4Record -EventRecord $event -EvidenceType 'SecurityRc4Evidence' -Rc4Triggers $triggers -MaxMessageLength ([int]$config.MaxMessageLength)))
+                }
+            }
+
+            foreach ($event in $systemEvents) {
+                [void]$records.Add((Convert-EventToRc4Record -EventRecord $event -EvidenceType 'KdcsvcDependencyOrHardening' -Rc4Triggers @() -MaxMessageLength ([int]$config.MaxMessageLength)))
+            }
+
+            $recordsArray = $records.ToArray()
+            $matchingCount = $recordsArray.Count
+            Write-MonitorLog -Message ("Matching events count: {0}" -f $matchingCount) -Level 'INFO' -LogPath $logFile
+
+            $newSecurityRecordId = [long]$securityState.LastRecordId
+            $newSystemRecordId = [long]$systemState.LastRecordId
+            if ($securityEvents.Count -gt 0) {
+                $newSecurityRecordId = [long](($securityEvents | Select-Object -Last 1).RecordId)
+            }
+            if ($systemQuery.Events.Count -gt 0) {
+                $newSystemRecordId = [long](($systemQuery.Events | Select-Object -Last 1).RecordId)
+            }
         }
 
         $runEndUtc = (Get-Date).ToUniversalTime()
@@ -884,11 +1039,16 @@ function Invoke-KerberosRc4Monitor {
                 Write-MonitorLog -Message 'WhatIf active: no state update by design.' -Level 'INFO' -LogPath $logFile
             }
             else {
-                $stateCanAdvance = $true
+                if ($isTestInputMode) {
+                    Write-MonitorLog -Message 'Test input mode with no matching records: no state update by design.' -Level 'INFO' -LogPath $logFile
+                }
+                else {
+                    $stateCanAdvance = $true
+                }
             }
         }
 
-        if ($stateCanAdvance) {
+        if ($stateCanAdvance -and -not $isTestInputMode) {
             $completionUtc = (Get-Date).ToUniversalTime().ToString('o')
             $securityState.LastRecordId = $newSecurityRecordId
             $securityState.LastProcessedTimeUtc = $completionUtc
@@ -903,8 +1063,11 @@ function Invoke-KerberosRc4Monitor {
                 Write-MonitorLog -Message ("State updated. Security.LastRecordId={0}; System.LastRecordId={1}" -f $securityState.LastRecordId, $systemState.LastRecordId) -Level 'INFO' -LogPath $logFile
             }
         }
-        else {
+        elseif (-not $isTestInputMode) {
             Write-MonitorLog -Message 'State was not updated because processing/email did not complete successfully.' -Level 'WARN' -LogPath $logFile
+        }
+        else {
+            Write-MonitorLog -Message 'Test input mode: state update skipped by design.' -Level 'INFO' -LogPath $logFile
         }
 
         Write-MonitorLog -Message 'Run completed.' -Level 'INFO' -LogPath $logFile
@@ -923,4 +1086,4 @@ function Invoke-KerberosRc4Monitor {
     }
 }
 
-Invoke-KerberosRc4Monitor -MonitorConfigPath $ConfigPath
+Invoke-KerberosRc4Monitor -MonitorConfigPath $ConfigPath -TestInputPath $TestInputJsonPath
