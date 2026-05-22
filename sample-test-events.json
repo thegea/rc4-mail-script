@@ -1,0 +1,25 @@
+[
+  {
+    "TimeCreatedUtc": "2026-05-22 08:00:00",
+    "LogName": "Security",
+    "EventId": 4769,
+    "RecordId": 123456,
+    "EvidenceType": "Actual RC4 Kerberos ticket/session/pre-auth evidence",
+    "RC4Trigger": "TicketEncryptionType=0x17",
+    "TargetUserName": "testuser",
+    "ServiceName": "HTTP/rc4test.internal.local",
+    "ClientAddress": "10.10.10.25",
+    "TicketEncryptionType": "0x17",
+    "EventMessage": "Synthetic RC4 test event"
+  },
+  {
+    "TimeCreatedUtc": "2026-05-22 08:02:00",
+    "LogName": "System",
+    "EventId": 203,
+    "RecordId": 98765,
+    "EvidenceType": "RC4 dependency/hardening warning or enforcement event",
+    "TargetUserName": "svc_legacy",
+    "ServiceName": "MSSQLSvc/sql01.internal.local:1433",
+    "EventMessage": "Synthetic Kdcsvc hardening event"
+  }
+]
