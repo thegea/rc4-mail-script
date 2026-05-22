@@ -821,7 +821,7 @@ function Invoke-KerberosRc4Monitor {
             [void]$records.Add((Convert-EventToRc4Record -EventRecord $event -EvidenceType 'KdcsvcDependencyOrHardening' -Rc4Triggers @() -MaxMessageLength ([int]$config.MaxMessageLength)))
         }
 
-        $recordsArray = @($records)
+        $recordsArray = $records.ToArray()
         $matchingCount = $recordsArray.Count
         Write-MonitorLog -Message ("Matching events count: {0}" -f $matchingCount) -Level 'INFO' -LogPath $logFile
 
