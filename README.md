@@ -1,4 +1,4 @@
-# Kerberos RC4 Monitor (Windows DC, PowerShell 5.1)
+# Kerberos RC4 Monitor (Windows DC)
 
 This repository contains three scripts:
 
